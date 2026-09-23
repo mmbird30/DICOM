@@ -3,160 +3,195 @@ import pydicom
 import shutil
 import time
 from datetime import datetime
+from pydicom.multival import MultiValue
+from pydicom.uid import generate_uid
 
 # 获取当前时间戳和日期
 timestamp = str(int(datetime.now().timestamp()))
 current_date = datetime.now().strftime('%Y%m%d')
 
 # 输出目标目录
-output_dir = "./Target"
+output_dir_name = "Target"
+# 获取脚本所在目录的绝对路径
+current_dir = os.path.dirname(os.path.abspath(__file__))
+output_dir = os.path.join(current_dir, output_dir_name)
 
 # 创建目标目录
 if not os.path.exists(output_dir):
     os.makedirs(output_dir)
 
-# 只处理脚本所在目录及其子目录中的 DICOM 文件
-current_dir = os.path.dirname(os.path.abspath(__file__))
-
 print(f"脚本位置: {current_dir}")
-print(f"只处理当前目录及其子目录中的 DICOM 文件")
+print(f"输出目录: {output_dir}")
 
-# 只处理脚本所在的目录
-target_directories = [current_dir]
-
-print(f"处理目录: {os.path.basename(current_dir)}")
-
-def find_dicom_files(directories):
-    """递归查找指定目录及其子目录中的所有 DICOM 文件"""
+def find_dicom_files(root_directory):
+    """递归查找指定目录及其子目录中的所有 DICOM 文件，排除输出目录"""
     all_dicom_files = []
+
+    print(f"开始扫描目录: {root_directory}")
     
-    for directory in directories:
-        dir_name = os.path.basename(directory)
-        print(f"\n扫描目录: {dir_name}")
-        dir_dicom_files = []
+    for root, dirs, files in os.walk(root_directory):
+        # --- [修复1] 关键修复：防止扫描到输出目录 ---
+        # 如果输出目录在当前扫描的路径中，修改 dirs 列表以阻止进入该目录
+        if output_dir_name in dirs:
+            dirs.remove(output_dir_name)
         
-        # 扫描指定目录及其子目录
-        for root, dirs, files in os.walk(directory):
-            for file in files:
-                if file.lower().endswith('.dcm'):
-                    full_path = os.path.join(root, file)
-                    # 计算相对于扫描目录的相对路径
-                    relative_to_dir = os.path.relpath(full_path, directory)
-                    
-                    dir_dicom_files.append((full_path, relative_to_dir, file))
-        
-        print(f"  发现 {len(dir_dicom_files)} 个 DICOM 文件")
-        all_dicom_files.extend(dir_dicom_files)
+        for file in files:
+            # 宽松检查后缀，有些DICOM文件没有后缀，如果需要更严谨可以用 try-read
+            if file.lower().endswith(('.dcm', '.dicom', '.ima')):
+                full_path = os.path.join(root, file)
+                relative_to_dir = os.path.relpath(full_path, root_directory)
+                all_dicom_files.append((full_path, relative_to_dir, file))
     
     return all_dicom_files
 
-dcm_files_info = find_dicom_files(target_directories)
+
+UID_KEYWORDS_TO_REMAP = {
+    'StudyInstanceUID',
+    'SeriesInstanceUID',
+    'SOPInstanceUID',
+    'ReferencedSOPInstanceUID',
+}
+
+
+def get_or_create_uid(uid_map, old_uid):
+    """返回旧 UID 对应的新 UID；缺失 UID 则单独生成。"""
+    if old_uid is None:
+        return generate_uid()
+
+    old_uid = str(old_uid)
+    if not old_uid:
+        return generate_uid()
+    if old_uid not in uid_map:
+        uid_map[old_uid] = generate_uid()
+    return uid_map[old_uid]
+
+
+def register_uid_mappings(ds, uid_map):
+    """递归收集需要替换的实例级 UID，并为相同旧 UID 保持同一映射。"""
+    for element in ds:
+        if element.VR == 'SQ':
+            for item in element.value:
+                register_uid_mappings(item, uid_map)
+        elif element.keyword in UID_KEYWORDS_TO_REMAP:
+            values = element.value if isinstance(element.value, MultiValue) else [element.value]
+            for value in values:
+                get_or_create_uid(uid_map, value)
+
+
+def replace_uid_references(ds, uid_map):
+    """递归替换顶层及序列内的 Study、Series、SOP 实例 UID。"""
+    for element in ds:
+        if element.VR == 'SQ':
+            for item in element.value:
+                replace_uid_references(item, uid_map)
+        elif element.keyword in UID_KEYWORDS_TO_REMAP:
+            if isinstance(element.value, MultiValue):
+                element.value = [uid_map.get(str(value), value) for value in element.value]
+            else:
+                element.value = uid_map.get(str(element.value), element.value)
+
+dcm_files_info = find_dicom_files(current_dir)
 
 if not dcm_files_info:
-    print("\n指定的目录中没有找到 DICOM 文件（.dcm）")
+    print("\n指定的目录中没有找到 DICOM 文件")
     exit(1)
 
-print(f"\n总共找到 {len(dcm_files_info)} 个 DICOM 文件：")
-for full_path, relative_path, filename in dcm_files_info:
-    print(f"  {relative_path}")
+print(f"\n总共找到 {len(dcm_files_info)} 个 DICOM 文件")
 
-# 分析原始 DICOM 文件，按照 StudyInstanceUID 和 SeriesInstanceUID 分组
-print("\n分析原始 DICOM 文件的序列信息...")
-series_groups = {}  # {(original_study_uid, original_series_uid): [file_info_list]}
+# --- [修复2] 逻辑修复：建立 Study、Series 和 SOP 层级的 UID 映射 ---
+print("\n分析原始 DICOM 文件并建立 UID 映射...")
+study_uid_map = {}  # {old_study_uid: new_study_uid}
+series_uid_map = {}  # {(old_study_uid, old_series_uid): new_series_uid}
+uid_map = {}  # 所有顶层及嵌套实例 UID 的统一映射
+files_to_process = []
 
 for full_path, relative_path, filename in dcm_files_info:
     try:
-        ds = pydicom.dcmread(full_path)
+        # --- [修复3] 性能优化：只读取头部信息，不读取像素数据 ---
+        ds = pydicom.dcmread(full_path, stop_before_pixels=True)
+
         original_study_uid = getattr(ds, 'StudyInstanceUID', 'unknown_study')
         original_series_uid = getattr(ds, 'SeriesInstanceUID', 'unknown_series')
+        original_sop_uid = getattr(ds, 'SOPInstanceUID', None)
+
+        # 先收集所有顶层和嵌套引用 UID，确保整批文件使用同一映射
+        register_uid_mappings(ds, uid_map)
         
-        key = (original_study_uid, original_series_uid)
-        if key not in series_groups:
-            series_groups[key] = []
-        series_groups[key].append((full_path, relative_path, filename, ds))
-        
+        # 如果是新的 Study，生成一个新的 UID
+        if original_study_uid not in study_uid_map:
+            # --- [修复4] 合规性：使用符合标准的 UID 生成方式 ---
+            study_uid_map[original_study_uid] = get_or_create_uid(
+                uid_map, original_study_uid
+            )
+
+        # 同一个 Study 下的同一个 Series 使用相同的新 UID
+        series_key = (original_study_uid, original_series_uid)
+        if series_key not in series_uid_map:
+            series_uid_map[series_key] = get_or_create_uid(
+                uid_map, original_series_uid
+            )
+
+        files_to_process.append({
+            'full_path': full_path,
+            'relative_path': relative_path,
+            'new_study_uid': study_uid_map[original_study_uid],
+            'new_series_uid': series_uid_map[series_key],
+            'new_sop_uid': get_or_create_uid(uid_map, original_sop_uid)
+        })
+
     except Exception as e:
         print(f"警告：无法读取文件 {relative_path}: {e}")
 
-print(f"发现 {len(series_groups)} 个不同的序列组：")
-for i, (key, files) in enumerate(series_groups.items()):
-    original_study_uid, original_series_uid = key
-    print(f"  序列组 {i+1}: {len(files)} 个文件 (Study: {original_study_uid[:20]}..., Series: {original_series_uid[:20]}...)")
+print(f"发现 {len(study_uid_map)} 个不同的 Study (检查)。")
+print(f"发现 {len(series_uid_map)} 个不同的 Series (检查)。")
+print(f"即将开始处理...\n")
 
-# 为每个序列组生成新的 Study UID 和 Series UID
-series_uid_mapping = {}
-base_timestamp = str(int(datetime.now().timestamp() * 1000))
-
-for i, (original_key, files) in enumerate(series_groups.items()):
-    new_study_uid = f"1.2.840.10008.{base_timestamp}.{i}.study"
-    new_series_uid = f"1.2.840.10008.{base_timestamp}.{i}.series"
-    
-    series_uid_mapping[original_key] = {
-        'new_study_uid': new_study_uid,
-        'new_series_uid': new_series_uid
-    }
-
-# 处理每个 DICOM 文件，保持序列完整性
-print(f"\n开始处理 DICOM 文件...")
 processed_count = 0
-
-for series_key, files in series_groups.items():
-    original_study_uid, original_series_uid = series_key
-    uid_info = series_uid_mapping[series_key]
+for file_info in files_to_process:
+    processed_count += 1
+    src_path = file_info['full_path']
+    rel_path = file_info['relative_path']
+    new_study_uid = file_info['new_study_uid']
+    new_series_uid = file_info['new_series_uid']
+    new_sop_uid = file_info['new_sop_uid']
     
-    print(f"\n处理序列组: {len(files)} 个文件")
-    print(f"  原始 StudyUID: {original_study_uid}")
-    print(f"  新的 StudyUID: {uid_info['new_study_uid']}")
-    print(f"  新的 SeriesUID: {uid_info['new_series_uid']}")
-    
-    for file_index, (full_path, relative_path, filename, ds) in enumerate(files):
-        processed_count += 1
-        print(f"\n  处理文件 ({processed_count}/{len(dcm_files_info)}): {relative_path}")
-        
-        # 为每个文件生成唯一的 SOPInstanceUID
-        sop_timestamp = str(int(datetime.now().timestamp() * 1000000))  # 微秒时间戳
-        new_sop_uid = f"1.2.840.10008.{sop_timestamp}.{file_index}.sop"
-        
-        # 复制原始的 DICOM 数据集
-        new_ds = ds.copy()
-        
-        # 修改 UID 相关字段 - 同一序列使用相同的 Study 和 Series UID
-        new_ds.StudyInstanceUID = uid_info['new_study_uid']
-        new_ds.SeriesInstanceUID = uid_info['new_series_uid']
-        new_ds.SOPInstanceUID = new_sop_uid  # 每个文件都有唯一的 SOP UID
-        
-        # 创建输出目录结构（保持原始目录结构）
-        output_relative_dir = os.path.dirname(relative_path)
-        if output_relative_dir:
-            output_full_dir = os.path.join(output_dir, output_relative_dir)
-            if not os.path.exists(output_full_dir):
-                os.makedirs(output_full_dir)
-        
-        # 设置输出文件路径（保持原始目录结构和文件名）
-        output_path = os.path.join(output_dir, relative_path)
-        
-        # 保存修改后的 DICOM 文件
-        try:
-            new_ds.save_as(output_path)
-            print(f"    已保存: {output_path}")
-            print(f"    SOPInstanceUID: {new_sop_uid}")
-        except Exception as e:
-            print(f"    保存文件失败 {relative_path}: {e}")
-        
-        # 添加小延迟确保时间戳唯一性
-        time.sleep(0.001)
+    if processed_count % 10 == 0:
+        print(f"进度: {processed_count}/{len(files_to_process)}", end='\r')
 
-print(f"\n所有文件处理完成！")
-print(f"  总共处理: {len(dcm_files_info)} 个 DICOM 文件")
-print(f"  序列组数: {len(series_groups)} 个")
-print(f"  保持了原始的序列完整性")
+    try:
+        # 这里需要读取完整数据以保存
+        ds = pydicom.dcmread(src_path)
+
+        # 同步替换序列内引用的 Study、Series 和 SOP UID
+        replace_uid_references(ds, uid_map)
+        
+        # 修改 Study、Series 和 SOP 层级的 UID
+        ds.StudyInstanceUID = new_study_uid
+        ds.SeriesInstanceUID = new_series_uid
+        ds.SOPInstanceUID = new_sop_uid
+
+        # 文件元信息中的 SOP UID 必须与数据集中的 SOP UID 保持一致
+        if hasattr(ds, 'file_meta') and ds.file_meta is not None:
+            ds.file_meta.MediaStorageSOPInstanceUID = new_sop_uid
+        
+        # 构建输出路径
+        dest_path = os.path.join(output_dir, rel_path)
+        dest_folder = os.path.dirname(dest_path)
+        
+        if not os.path.exists(dest_folder):
+            os.makedirs(dest_folder)
+
+        ds.save_as(dest_path)
+        
+    except Exception as e:
+        print(f"\n处理失败: {rel_path} - {e}")
+
+print(f"\n\n所有文件处理完成！")
+print(f"共处理: {len(files_to_process)} 个文件")
 
 # 压缩目标文件夹
-folder_path = 'Target'
-zip_filename = 'modified_dicom_files.zip'
+print("正在压缩文件...")
+zip_filename = os.path.join(current_dir, 'modified_dicom_files') # 不需要加 .zip，shutil会自动加
+shutil.make_archive(zip_filename, 'zip', output_dir)
 
-# 压缩为 ZIP 文件
-shutil.make_archive(zip_filename.replace('.zip', ''), 'zip', folder_path)
-print(f'\n{zip_filename} 创建成功！')
-print(f'包含 {len(series_groups)} 个序列组，共 {len(dcm_files_info)} 个 DICOM 文件。')
-
+print(f'\n压缩包创建成功: {zip_filename}.zip')
